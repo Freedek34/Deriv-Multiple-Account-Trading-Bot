@@ -1,0 +1,352 @@
+import sys
+import os
+import json
+import random
+import asyncio
+import websockets
+from deriv_api import DerivAPI, APIError
+from typing import List, Dict, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor
+
+# Configuration
+APP_ID = 63411
+MASTER_API_TOKEN = os.getenv('DERIV_MASTER_TOKEN', 'Enter Master Token Here')
+SUBSIDIARY_TOKENS = [t.strip() for t in os.getenv('DERIV_SUBSIDIARY_TOKENS', 'Enter as many Subsidiary Token Here,Enter as many Subsidiary Token Here').split(',')]
+BET_AMOUNT = 1
+TOTAL_ROUNDS = 10
+URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+MAX_CONCURRENT_TRADES = 50  # Adjust based on API rate limits
+AUTH_DELAY = 1.0  # Delay between authorizations to prevent rate limiting
+TRADE_DELAY = 0.1  # Delay between trades in milliseconds
+PROFIT_CHECK_DELAY = 0.1  # Delay between profit checks in milliseconds
+MARTINGALE_MULTIPLIER = 2.0  # How much to multiply the bet after each loss
+MAX_MARTINGALE_STEPS = 4  # Maximum number of consecutive martingale steps
+
+if not MASTER_API_TOKEN or not SUBSIDIARY_TOKENS:
+    sys.exit("DERIV_MASTER_TOKEN and DERIV_SUBSIDIARY_TOKENS environment variables must be set")
+
+class TradingAccount:
+    def __init__(self, api_token: str, account_id: int, is_master: bool = False):
+        self.api_token = api_token
+        self.account_id = account_id
+        self.is_master = is_master
+        self.api = DerivAPI(app_id=APP_ID)
+        self.balance = 0
+        self.initial_balance = 0
+        self.contracts = []
+        self.semaphore = asyncio.Semaphore(MAX_CONCURRENT_TRADES)
+        self.authorized = False
+        self.last_profit = None
+        
+    async def authorize(self):
+        try:
+            print(f"Authorizing {'master' if self.is_master else 'subsidiary'} account {self.account_id}...")
+            auth_response = await self.api.authorize(self.api_token)
+            
+            if 'error' in auth_response:
+                print(f"Authorization failed for account {self.account_id}: {auth_response['error']['message']}")
+                return False
+                
+            balance = await self.api.balance()
+            self.balance = balance['balance']['balance']
+            self.initial_balance = self.balance
+            self.authorized = True
+            print(f"Account {self.account_id} authorized. Balance: {self.balance}")
+            return True
+            
+        except APIError as e:
+            print(f"API Error authorizing account {self.account_id}: {e}")
+            return False
+        except Exception as e:
+            print(f"Unexpected error authorizing account {self.account_id}: {e}")
+            return False
+        
+    async def place_trade(self, contract_type: str, amount: float) -> Optional[Dict]:
+        if not self.authorized:
+            print(f"Account {self.account_id} not authorized, skipping trade")
+            return None
+            
+        async with self.semaphore:
+            try:
+                # Get proposal for trade
+                proposal = await self.api.proposal({
+                    "proposal": 1,
+                    "amount": amount,
+                    "barrier": "0",
+                    "basis": "stake",
+                    "contract_type": contract_type,
+                    "currency": "USD",
+                    "duration": 1,
+                    "duration_unit": "t",
+                    "symbol": "R_100"
+                })
+                
+                if 'error' in proposal:
+                    print(f"Proposal error for account {self.account_id}: {proposal['error']['message']}")
+                    return None
+                    
+                proposal_id = proposal.get('proposal', {}).get('id')
+                if not proposal_id:
+                    print(f"Failed to get proposal for account {self.account_id}")
+                    return None
+                    
+                # Place trade with delay to ensure systematic execution
+                await asyncio.sleep(TRADE_DELAY)
+                buy_response = await self.api.buy({"buy": proposal_id, "price": amount})
+                
+                if 'error' in buy_response:
+                    print(f"Buy error for account {self.account_id}: {buy_response['error']['message']}")
+                    return None
+                    
+                contract_id = buy_response.get('buy', {}).get('contract_id')
+                if not contract_id:
+                    print(f"Failed to get contract ID for account {self.account_id}")
+                    return None
+                    
+                return buy_response
+                
+            except APIError as e:
+                print(f"API Error placing trade for account {self.account_id}: {e}")
+                return None
+            except Exception as e:
+                print(f"Unexpected error placing trade for account {self.account_id}: {e}")
+                return None
+                
+    async def check_profit(self) -> Optional[float]:
+        if not self.authorized:
+            return None
+            
+        try:
+            # Add delay to ensure systematic profit checking
+            await asyncio.sleep(PROFIT_CHECK_DELAY)
+            profit_table = await self.api.profit_table({"profit_table": 1, "limit": 1, "sort": "DESC"})
+            
+            if 'error' in profit_table:
+                print(f"Profit table error for account {self.account_id}: {profit_table['error']['message']}")
+                return None
+                
+            if profit_table and 'profit_table' in profit_table and profit_table['profit_table'].get('transactions'):
+                last_trade = profit_table['profit_table']['transactions'][0]
+                profit = last_trade.get('sell_price', 0) - last_trade.get('buy_price', 0)
+                self.last_profit = profit
+                return profit
+            return None
+        except APIError as e:
+            print(f"API Error checking profit for account {self.account_id}: {e}")
+            return None
+        except Exception as e:
+            print(f"Unexpected error checking profit for account {self.account_id}: {e}")
+            return None
+
+class TradingSystem:
+    def __init__(self):
+        self.master_account = TradingAccount(MASTER_API_TOKEN, account_id=0, is_master=True)
+        self.subsidiary_accounts = [
+            TradingAccount(token, account_id=i+1) 
+            for i, token in enumerate(SUBSIDIARY_TOKENS)
+        ]
+        self.current_round = 0
+        self.executor = ThreadPoolExecutor(max_workers=10)
+        self.initialized = False
+        self.martingale_counter = 0  # Tracks consecutive losses for the system
+        self.current_bet_amount = BET_AMOUNT  # Current bet amount considering martingale
+        
+    def reset_martingale(self):
+        """Reset martingale counter and bet amount after a win"""
+        self.martingale_counter = 0
+        self.current_bet_amount = BET_AMOUNT
+        print("Martingale reset - back to base bet amount")
+        
+    def increment_martingale(self):
+        """Increment martingale counter and adjust bet amount after a loss"""
+        if self.martingale_counter < MAX_MARTINGALE_STEPS:
+            self.martingale_counter += 1
+            self.current_bet_amount = BET_AMOUNT * (MARTINGALE_MULTIPLIER ** self.martingale_counter)
+            print(f"Martingale increased to step {self.martingale_counter} (Bet: {self.current_bet_amount:.2f})")
+        else:
+            # Reset if we've reached max steps to prevent infinite martingale
+            self.reset_martingale()
+            print("Max martingale steps reached - resetting")
+        
+    async def initialize(self):
+        """Authorize all accounts sequentially with delays"""
+        print("\nInitializing trading system...")
+        
+        # Authorize master account first
+        if not await self.master_account.authorize():
+            raise Exception("Master account authorization failed")
+        await asyncio.sleep(AUTH_DELAY)
+        
+        # Authorize subsidiary accounts one by one with delays
+        for account in self.subsidiary_accounts:
+            if not await account.authorize():
+                print(f"Warning: Account {account.account_id} authorization failed")
+            await asyncio.sleep(AUTH_DELAY)
+        
+        # Only keep authorized accounts
+        self.subsidiary_accounts = [acc for acc in self.subsidiary_accounts if acc.authorized]
+        self.initialized = True
+        print(f"\nInitialization complete. {len(self.subsidiary_accounts)} subsidiary accounts ready.")
+            
+    async def collect_data(self):
+        """Master account collects tick data"""
+        if not self.master_account.authorized:
+            print("Master account not authorized, cannot collect data")
+            return None
+            
+        try:
+            async with websockets.connect(URL) as websocket:
+                await websocket.send(json.dumps({
+                    "ticks_history": "R_100",
+                    "adjust_start_time": 1,
+                    "count": 100,
+                    "end": "latest",
+                    "start": 1,
+                    "style": "ticks"
+                }))
+                response = await websocket.recv()
+                data = json.loads(response)
+                if 'history' in data and 'prices' in data['history']:
+                    prices = data['history']['prices']
+                    digits = [int(str(price)[-1]) for price in prices] 
+                    return digits
+                else:
+                    print("Master account failed to retrieve data")
+                    return None
+        except Exception as e:
+            print(f"Error collecting data: {e}")
+            return None
+                
+    async def distribute_trades(self, contract_type: str):
+        """Distribute trades across all authorized accounts systematically with delays"""
+        if not self.initialized:
+            print("System not initialized, cannot distribute trades")
+            return []
+            
+        accounts_to_trade = [acc for acc in [self.master_account] + self.subsidiary_accounts if acc.authorized]
+        
+        if not accounts_to_trade:
+            print("No authorized accounts available for trading")
+            return []
+            
+        print(f"Distributing trades to {len(accounts_to_trade)} authorized accounts (Bet: {self.current_bet_amount:.2f})")
+        
+        # Execute trades sequentially with delays
+        successful_trades = []
+        for account in accounts_to_trade:
+            try:
+                result = await account.place_trade(contract_type, self.current_bet_amount)
+                if result is not None:
+                    successful_trades.append((account, result))
+            except Exception as e:
+                print(f"Trade failed for account {account.account_id}: {e}")
+                
+        print(f"Successfully placed {len(successful_trades)}/{len(accounts_to_trade)} trades")
+        return successful_trades
+        
+    async def check_all_profits(self):
+        """Check profits for all accounts systematically with delays"""
+        if not self.initialized:
+            return []
+            
+        authorized_accounts = [acc for acc in [self.master_account] + self.subsidiary_accounts if acc.authorized]
+        results = []
+        
+        # Check profits sequentially with delays
+        for account in authorized_accounts:
+            try:
+                profit = await account.check_profit()
+                results.append((account, profit))
+            except Exception as e:
+                print(f"Failed to check profit for account {account.account_id}: {e}")
+                results.append((account, None))
+                
+        return results
+        
+    async def run_trading_round(self):
+        """Execute one round of trading with centralized martingale logic"""
+        if not self.initialized:
+            print("System not initialized, skipping round")
+            return
+            
+        self.current_round += 1
+        print(f"\n=== Starting Round {self.current_round}/{TOTAL_ROUNDS} ===")
+        print(f"Current Martingale State: Step {self.martingale_counter}, Bet Amount: {self.current_bet_amount:.2f}")
+        
+        try:
+            # Collect data
+            digits = await self.collect_data()
+            if not digits:
+                print("No data received, skipping round")
+                return
+                
+            # Make prediction
+            predicted_even_odd = random.randint(0, 1)
+            contract_type = "DIGITEVEN" if predicted_even_odd == 1 else "DIGITODD"
+            print(f"Master prediction: {'Even' if predicted_even_odd == 1 else 'Odd'}")
+            
+            # Execute trades systematically
+            trade_results = await self.distribute_trades(contract_type)
+            await asyncio.sleep(1)  # Wait for trades to settle
+            
+            # Check profits systematically
+            profit_results = await self.check_all_profits()
+            
+            # Process master account result first to determine martingale
+            master_result = next((r for a, r in profit_results if a.is_master), None)
+            if master_result is not None:
+                self.master_account.balance += master_result
+                print(f"Master account result: {'WIN' if master_result > 0 else 'LOSS'} ({master_result:.2f})")
+                
+                # Update martingale based on master account result
+                if master_result > 0:
+                    self.reset_martingale()
+                else:
+                    self.increment_martingale()
+                    
+            # Process subsidiary account results
+            for account, profit in profit_results:
+                if not account.is_master and profit is not None:
+                    account.balance += profit
+                    print(f"Subsidiary {account.account_id} result: {'WIN' if profit > 0 else 'LOSS'} ({profit:.2f})")
+                    
+        except Exception as e:
+            print(f"Error during trading round {self.current_round}: {e}")
+
+async def main():
+    try:
+        trading_system = TradingSystem()
+        await trading_system.initialize()
+        
+        if not trading_system.initialized:
+            print("Initialization failed, exiting")
+            return
+            
+        for _ in range(TOTAL_ROUNDS):
+            await trading_system.run_trading_round()
+            await asyncio.sleep(0.5)  # Brief pause between rounds
+    
+        # Final report
+        print("\n=== Final Balances ===")
+        authorized_accounts = [acc for acc in [trading_system.master_account] + trading_system.subsidiary_accounts if acc.authorized]
+        
+        for account in authorized_accounts:
+            net_profit = account.balance - account.initial_balance
+            account_type = "Master" if account.is_master else f"Subsidiary {account.account_id}"
+            print(f"\n{account_type} Account:")
+            print(f"  Initial Balance: {account.initial_balance:.2f}")
+            print(f"  Current Balance: {account.balance:.2f}")
+            print(f"  Net Profit: {net_profit:.2f}")
+            
+        total_initial = sum(acc.initial_balance for acc in authorized_accounts)
+        total_final = sum(acc.balance for acc in authorized_accounts)
+        print(f"\nTotal Net Profit Across All Accounts: {total_final - total_initial:.2f}")
+        print(f"Final Martingale State: Step {trading_system.martingale_counter}")
+
+    except Exception as e:
+        print(f"Fatal error: {e}")
+    finally:
+        print("\nTrading session completed")
+
+if __name__ == "__main__":
+    asyncio.run(main())
